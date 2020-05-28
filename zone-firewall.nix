@@ -7,15 +7,24 @@ let
 
   zones = unique ((attrValues cfg.interfaces) ++ [cfg.localZone]);
 
+  ruleMatches = situation: rule:
+    let conditionMatches = cond:
+          all (key: let condValue = cond.${key} or "*";
+                    in
+                      (elem situation.${key} condValue) ||
+                      (elem "*" condValue))
+            (attrNames situation);
+    in
+      any conditionMatches
+        (if rule.conditions != null
+         then rule.conditions
+         else [{}]);
+    
   rulesForZone = type: from: to: 
     let
-      matcher = rule: (
-        (rule.type == type) &&
-        ((elem from rule.fromZone) || (elem "*" rule.fromZone)) &&
-        ((elem to rule.toZone) || (elem "*" rule.toZone))
-      );
+      matcher = ruleMatches { inherit from to; };
 
-      filteredRules = filter matcher cfg.rules;
+      filteredRules = filter matcher (attrValues cfg.rules);
       isHairpin = 
         cfg.allowHairpin
         && (from == to)
@@ -29,7 +38,7 @@ let
 
   globalRules = genAttrs ["filter" "nat"]
     (type: map normalizeRule
-      (filter (rule: rule.type == type) cfg.globalRules));
+      (filter (rule: rule.type == type) (attrValues cfg.globalRules)));
 
   chainForZonePair = from: to:
       "nixos-zone-${serializedZoneName from}/${serializedZoneName to}";
@@ -107,14 +116,13 @@ in {
       description = ''
         Rules for filtering packets.
 
-        Each rule is an object with
         Values are a list of rules. A rule must be an nftables filter
         string (as you might write on an "nft add rule" command line,
         just without the table or chain parameters).
       '';
 
-      default = [];
-      type = listOf (submodule {
+      default = {};
+      type = attrsOf (submodule {
         options = ruleBaseOptions // {
           type = mkOption {
             description = ''
@@ -126,20 +134,34 @@ in {
             default = "filter";
           };
 
-          fromZone = mkOption {
+          conditions = mkOption {
             description = ''
-              Source zone. May be one of the zones in 'interfaces',
-              the local zone, '*' for all zones, or null for a packet that
-              doesn't match an existing zone.
+              List of conditions under which the rule should apply. If
+              any item in this list matches, the associated rule is
+              added to the chain.
             '';
-            default = "*";
-            type = zoneListT;
-          };
+            example = [
+              { from = "*"; to = "local"; }
+            ];
+            type = listOf (submodule {
+              options = {
+                from = mkOption {
+                  description = ''
+                    Source zone. May be one of the zones in 'interfaces',
+                    the local zone, '*' for all zones, null for a packet that
+                    doesn't match an existing zone, or a list of the above.
+                  '';
+                  default = "*";
+                  type = zoneListT;
+                };
 
-          toZone = mkOption {
-            description = "Destination zone. See fromZone for details";
-            default = "*";
-            type = zoneListT;
+                to = mkOption {
+                  description = "Destination zone. See from for details";
+                  default = "*";
+                  type = zoneListT;
+                };
+              };
+            });
           };
         };
       });
@@ -156,9 +178,9 @@ in {
         Rules that should always be run.
       '';
 
-      default = [];
+      default = {};
 
-      type = listOf (submodule {
+      type = attrsOf (submodule {
         options = ruleBaseOptions // {
           priority = mkOption (priorityOption // {
             description = priorityOption.description + ''
@@ -178,18 +200,23 @@ in {
 
     saneDefaults = mkOption {
       description = ''
-        Enable default rules allowing outbound traffic, ICMP traffic, and the standard related,established jazz.
+        Enable default rules allowing outbound traffic, ICMP traffic,
+        and the standard related,established jazz. You probably want
+        this enabled unless you want complete control over your
+        firewall.
 
-        Equivalent to
+        Equivalent to:
 
-        globalRules = [
-          { priority = 1000; rule = "jump nixos-relest"; }
-          { priority = 900; rule = "jump nixos-global-icmp"; }
-        ];
+        globalRules = {
+          sanePacketTrace = { priority = 2000; rule = "jump nixos-pkt-trace"; };
+          saneRelEst = { priority = 1000; rule = "jump nixos-relest"; };
+          saneICMP = { priority = 900; rule = "jump nixos-global-icmp"; };
+        };
 
-        rules = [
-          { fromZone = "local"; rule = "accept"; }
-        ];
+        rules.acceptFromLocal =
+          { conditions = [ {from = "local"; }]; rule = "accept"; priority = -1000; };
+
+        Note that the referenced chains always exist, and can be used even if 
       '';
 
       default = true;
@@ -208,15 +235,17 @@ in {
   config = mkMerge [
     (mkIf cfg.saneDefaults {
       networking.zone-firewall = {
-        globalRules = [
-          { priority = 2000; rule = "jump nixos-pkt-trace"; }
-          { priority = 1000; rule = "jump nixos-relest"; }
-          { priority = 900; rule = "jump nixos-global-icmp"; }
-        ];
+        globalRules = {
+          sanePacketTrace = { priority = 2000; rule = "jump nixos-pkt-trace"; };
+          saneRelEst = { priority = 1000; rule = "jump nixos-relest"; };
+          saneICMP = { priority = 900; rule = "jump nixos-global-icmp"; };
+        };
 
-        rules = [
-          { fromZone = "local"; rule = "accept"; priority = -1000; }
-        ];
+        # Default accept packets from the local zone.
+        rules.acceptFromLocal = {
+          conditions = [{from = cfg.localZone; }];
+          rule = "accept"; priority = -1000;
+        };
       };
     })
     (mkIf cfg.enable {
